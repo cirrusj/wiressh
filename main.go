@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cirrusj/wiressh/recorder"
 	"github.com/kevinburke/ssh_config"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -26,7 +27,10 @@ import (
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
-var debug bool
+var (
+	debug      bool
+	recordFile string
+)
 
 func main() {
 	// Parse arguments
@@ -37,6 +41,7 @@ func main() {
 	flag.StringVar(&wireConfigFile, "c", "~/.ssh/wiressh_config", "wiressh config")
 	flag.StringVar(&sshConfigFile, "s", "~/.ssh/config", "SSH config")
 	flag.StringVar(&sshKnownHosts, "k", "~/.ssh/known_hosts", "SSH known hosts")
+	flag.StringVar(&recordFile, "r", "", "Record session to file (asciicast v2 format)")
 	flag.BoolVar(&debug, "d", false, "Debug")
 	flag.Usage = func() {
 		_, _ = fmt.Fprintf(os.Stderr, `Usage of %s:
@@ -56,6 +61,14 @@ Flags:
 	if debug {
 		log.Println("Host:", host)
 	}
+
+	// Check if recording file exists
+	if recordFile != "" {
+		if _, err := os.Stat(recordFile); err == nil {
+			log.Fatalf("Recording file %s already exists", recordFile)
+		}
+	}
+
 	if debug {
 		log.Println("Config:", wireConfigFile)
 	}
@@ -262,7 +275,7 @@ Flags:
 	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(logLevel, ""))
 	err = dev.IpcSet(wgConf)
 	if err != nil {
-//		TODO: print an error
+		//		TODO: print an error
 		return
 	}
 	err = dev.Up()
@@ -381,6 +394,21 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 	if debug {
 		log.Println("TERM:", askTerm)
 	}
+
+	var rec *recorder.Recorder
+	if recordFile != "" {
+		w, h, err := term.GetSize(int(os.Stdin.Fd()))
+		if err != nil {
+			log.Println("Could not get term size. Setting to 80, 40")
+			w, h = 80, 40
+		}
+		rec, err = recorder.NewRecorder(recordFile, w, h, askTerm, fmt.Sprintf("wiressh session to %s", host))
+		if err != nil {
+			log.Fatalf("Failed to create recorder: %v", err)
+		}
+		defer rec.Close()
+	}
+
 	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
 		if originalState, err := term.MakeRaw(fd); err != nil {
 			log.Println("Fallback")
@@ -396,10 +424,6 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 				log.Println("Could not get term size. Setting to 80, 40")
 				w, h = 80, 40
 			}
-			// if debug {
-			// 	log.Println("Width:", w)
-			// 	log.Println("Height:", h)
-			// }
 			if err := session.RequestPty(askTerm, h, w, ssh.TerminalModes{
 				ssh.ECHO: 0,
 			}); err != nil {
@@ -432,9 +456,18 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 		log.Fatal(err)
 	}
 	go func() {
-		_, err := io.Copy(stdin, os.Stdin)
-		if err != nil {
-			log.Println("Error when doing an io.Copy:", err)
+		if rec != nil {
+			// Wrap stdin with recorder
+			tee := io.TeeReader(os.Stdin, &recordingWriter{rec: rec, isInput: true})
+			_, err := io.Copy(stdin, tee)
+			if err != nil {
+				log.Println("Error when doing an io.Copy:", err)
+			}
+		} else {
+			_, err := io.Copy(stdin, os.Stdin)
+			if err != nil {
+				log.Println("Error when doing an io.Copy:", err)
+			}
 		}
 	}()
 	stdout, err := session.StdoutPipe()
@@ -442,9 +475,18 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 		log.Fatal(err)
 	}
 	go func() {
-		_, err := io.Copy(os.Stdout, stdout)
-		if err != nil {
-			log.Println("Error when doing an io.Copy:", err)
+		if rec != nil {
+			// Wrap stdout with recorder
+			tee := io.TeeReader(stdout, &recordingWriter{rec: rec, isInput: false})
+			_, err := io.Copy(os.Stdout, tee)
+			if err != nil {
+				log.Println("Error when doing an io.Copy:", err)
+			}
+		} else {
+			_, err := io.Copy(os.Stdout, stdout)
+			if err != nil {
+				log.Println("Error when doing an io.Copy:", err)
+			}
 		}
 	}()
 	stderr, err := session.StderrPipe()
@@ -452,9 +494,18 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 		log.Fatal(err)
 	}
 	go func() {
-		_, err := io.Copy(os.Stderr, stderr)
-		if err != nil {
-			log.Println("Error when doing an io.Copy:", err)
+		if rec != nil {
+			// Wrap stderr with recorder
+			tee := io.TeeReader(stderr, &recordingWriter{rec: rec, isInput: false})
+			_, err := io.Copy(os.Stderr, tee)
+			if err != nil {
+				log.Println("Error when doing an io.Copy:", err)
+			}
+		} else {
+			_, err := io.Copy(os.Stderr, stderr)
+			if err != nil {
+				log.Println("Error when doing an io.Copy:", err)
+			}
 		}
 	}()
 
@@ -467,4 +518,22 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 	if err := session.Wait(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+// recordingWriter implements io.Writer and writes to the recorder
+type recordingWriter struct {
+	rec     *recorder.Recorder
+	isInput bool
+}
+
+func (w *recordingWriter) Write(p []byte) (n int, err error) {
+	if w.isInput {
+		err = w.rec.WriteInput(p)
+	} else {
+		err = w.rec.WriteOutput(p)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
 }

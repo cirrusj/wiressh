@@ -16,6 +16,8 @@ Flags:
   -d    Debug
   -k string
         SSH known hosts (default "~/.ssh/known_hosts")
+  -r string
+        Record session to file (asciicast v2 format)
   -s string
         SSH config (default "~/.ssh/config")
 ```
@@ -48,6 +50,14 @@ Host remote-server
 
 A small number of `ssh_config` keywords are supported (`User`, `HostName`, `Port`, `IdentityFile`).
 
+## Session Recording
+You can record your SSH session in asciicast v2 format using the `-r` flag:
+
+```shell
+./wiressh -r session.cast remote-server
+```
+
+The recorded session can be played back using tools like [asciinema](https://asciinema.org/) or [asciinema-player](https://github.com/asciinema/asciinema-player).
 
 ## Known problems
 
