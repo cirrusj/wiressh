@@ -39,7 +39,7 @@ func main() {
 	flag.StringVar(&sshKnownHosts, "k", "~/.ssh/known_hosts", "SSH known hosts")
 	flag.BoolVar(&debug, "d", false, "Debug")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, `Usage of %s:
+		_, _ = fmt.Fprintf(os.Stderr, `Usage of %s:
 	%s [flags] host
 Flags:
 `, progname, progname)
@@ -180,9 +180,7 @@ Flags:
 	if wgServer != nil && wgPort != "" {
 		wgConf = wgConf + fmt.Sprintf("endpoint=%s:%s\n", wgServer, wgPort)
 	}
-	if allowedIP != "" {
-		wgConf = wgConf + fmt.Sprintf("allowed_ip=%s\n", allowedIP)
-	}
+	wgConf = wgConf + fmt.Sprintf("allowed_ip=%s\n", allowedIP)
 	if debug {
 		log.Println(wgConf)
 	}
@@ -262,7 +260,11 @@ Flags:
 		logLevel = device.LogLevelVerbose
 	}
 	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(logLevel, ""))
-	dev.IpcSet(wgConf)
+	err = dev.IpcSet(wgConf)
+	if err != nil {
+//		TODO: print an error
+		return
+	}
 	err = dev.Up()
 	if err != nil {
 		log.Panic(err)
@@ -278,19 +280,18 @@ Flags:
 	}
 	sshSigner, err := ssh.ParsePrivateKey(sshKey)
 	if err != nil {
-		if _, ok := err.(*ssh.PassphraseMissingError); ok {
+		var passphraseMissingError *ssh.PassphraseMissingError
+		if errors.As(err, &passphraseMissingError) {
 			fmt.Print("Passphrase: ")
 			input, err := term.ReadPassword(int(os.Stdin.Fd()))
 			if err != nil {
 				log.Fatalf("Failed to read passphase: %s", err)
 			}
 			passphrase := strings.TrimSpace(strings.Trim(string(input), "\n"))
-			sshSigner, err = ssh.ParsePrivateKeyWithPassphrase([]byte(sshKey), []byte(passphrase))
+			sshSigner, err = ssh.ParsePrivateKeyWithPassphrase(sshKey, []byte(passphrase))
 			if err != nil {
 				log.Fatalf("Failed to decrypt private key: %s", err)
 			}
-		} else {
-			log.Fatalf("Failed to parse private key: %s", err)
 		}
 	}
 
@@ -329,11 +330,11 @@ func EncodeBase64ToHex(key string) (string, error) {
 
 func DialWG(network, addr string, config *ssh.ClientConfig, tnet *netstack.Net) (*ssh.Client, error) {
 	// Use wg tnet to dial the connection
-	conn, err := tnet.Dial(network, addr)
+	connection, err := tnet.Dial(network, addr)
 	if err != nil {
 		return nil, err
 	}
-	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
+	c, chans, reqs, err := ssh.NewClientConn(connection, addr, config)
 	if err != nil {
 		return nil, err
 	}
@@ -347,7 +348,12 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer sshClient.Close()
+	defer func(sshClient *ssh.Client) {
+		err := sshClient.Close()
+		if err != nil {
+			log.Println("Error when closing ssh:", err)
+		}
+	}(sshClient)
 	if debug {
 		log.Printf("Connected to %s\n", host)
 	}
@@ -355,7 +361,12 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer session.Close()
+	defer func(session *ssh.Session) {
+		err := session.Close()
+		if err != nil {
+			log.Println("Error when closing session:", err)
+		}
+	}(session)
 
 	// Configure the pty
 	var askTerm string
@@ -374,7 +385,12 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 		if originalState, err := term.MakeRaw(fd); err != nil {
 			log.Println("Fallback")
 		} else {
-			defer term.Restore(fd, originalState)
+			defer func(fd int, oldState *term.State) {
+				err := term.Restore(fd, oldState)
+				if err != nil {
+					log.Println("Error when restoring term:", err)
+				}
+			}(fd, originalState)
 			w, h, err := term.GetSize(fd)
 			if err != nil {
 				log.Println("Could not get term size. Setting to 80, 40")
@@ -398,7 +414,10 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 					}
 					newW, newH, _ := term.GetSize(fd)
 					if newW != w || newH != h {
-						session.WindowChange(h, w)
+						err := session.WindowChange(h, w)
+						if err != nil {
+							log.Println("Error when informing remote host of a window size change:", err)
+						}
 						h = newH
 						w = newW
 					}
@@ -412,17 +431,32 @@ func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.
 	if err != nil {
 		log.Fatal(err)
 	}
-	go io.Copy(stdin, os.Stdin)
+	go func() {
+		_, err := io.Copy(stdin, os.Stdin)
+		if err != nil {
+			log.Println("Error when doing an io.Copy:", err)
+		}
+	}()
 	stdout, err := session.StdoutPipe()
 	if err != nil {
 		log.Fatal(err)
 	}
-	go io.Copy(os.Stdout, stdout)
+	go func() {
+		_, err := io.Copy(os.Stdout, stdout)
+		if err != nil {
+			log.Println("Error when doing an io.Copy:", err)
+		}
+	}()
 	stderr, err := session.StderrPipe()
 	if err != nil {
 		log.Fatal(err)
 	}
-	go io.Copy(os.Stderr, stderr)
+	go func() {
+		_, err := io.Copy(os.Stderr, stderr)
+		if err != nil {
+			log.Println("Error when doing an io.Copy:", err)
+		}
+	}()
 
 	// Start the shell
 	if err := session.Shell(); err != nil {
