@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WireSSH Live Session</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.min.css" />
+    <style>
+        body {
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: #1e1e1e;
+            color: #f0f0f0;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            flex-direction: column;
+            height: 100vh;
+            overflow: hidden;
+        }
+        header {
+            background-color: #333;
+            color: #fff;
+            padding: 10px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            z-index: 10;
+        }
+        h1 {
+            margin: 0;
+            font-size: 1.2em;
+        }
+        .status {
+            font-size: 0.9em;
+            display: flex;
+            align-items: center;
+        }
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .connected {
+            background-color: #4CAF50;
+        }
+        .disconnected {
+            background-color: #F44336;
+        }
+        .container {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 10px;
+            overflow: hidden;
+        }
+        .info {
+            margin-bottom: 10px;
+            padding: 10px;
+            background-color: #2d2d2d;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }
+        #terminal-container {
+            flex: 1;
+            background-color: #000;
+            border-radius: 4px;
+            padding: 5px;
+            overflow: hidden;
+        }
+        footer {
+            background-color: #333;
+            color: #999;
+            padding: 10px 20px;
+            font-size: 0.8em;
+            text-align: center;
+            z-index: 10;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>WireSSH Live Session</h1>
+        <div class="status">
+            <div id="status-indicator" class="status-indicator disconnected"></div>
+            <span id="status-text">Disconnected</span>
+        </div>
+    </header>
+    
+    <div class="container">
+        <div class="info">
+        </div>
+        
+        <div id="terminal-container"></div>
+    </div>
+    
+    <footer>
+        Powered by WireSSH Live Sharing
+    </footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js" integrity="sha384-J4qzUjBl1FxyLsl/kQPQIOeINsmp17OHYXDOMpMxlKX53ZfYsL+aWHpgArvOuof9" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js" integrity="sha384-XGqKrV8Jrukp1NITJbOEHwg01tNkuXr6uB6YEj69ebpYU3v7FvoGgEg23C1Gcehk" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js" integrity="sha384-S1biLeI8L/bFduIVvCxbn/l4EtaG4nTqQjGF7qCYTbsGXGFe8KgIKXtw4+UWxprv" crossorigin="anonymous"></script>
+    <script>
+        // Initialize terminal
+        const terminal = new Terminal({
+            cursorBlink: false,
+            fontFamily: 'Menlo, Monaco, "Courier New", monospace',
+            fontSize: 14,
+            theme: {
+                background: '#000000',
+                foreground: '#f0f0f0',
+                cursor: '#f0f0f0',
+                selectionBackground: '#4040ff',
+                black: '#000000',
+                red: '#cc0000',
+                green: '#4e9a06',
+                yellow: '#c4a000',
+                blue: '#3465a4',
+                magenta: '#75507b',
+                cyan: '#06989a',
+                white: '#d3d7cf',
+                brightBlack: '#555753',
+                brightRed: '#ef2929',
+                brightGreen: '#8ae234',
+                brightYellow: '#fce94f',
+                brightBlue: '#729fcf',
+                brightMagenta: '#ad7fa8',
+                brightCyan: '#34e2e2',
+                brightWhite: '#eeeeec'
+            }
+        });
+        
+        // Get DOM elements
+        const statusIndicator = document.getElementById('status-indicator');
+        const statusText = document.getElementById('status-text');
+        
+        // Initialize terminal
+        terminal.open(document.getElementById('terminal-container'));
+        
+        // Add fit addon to make terminal resize with container
+        const fitAddon = new FitAddon.FitAddon();
+        terminal.loadAddon(fitAddon);
+        
+        // Add web links addon to make URLs clickable
+        terminal.loadAddon(new WebLinksAddon.WebLinksAddon());
+        
+        // Fit terminal to container
+        function fitTerminal() {
+            try {
+                fitAddon.fit();
+            } catch (err) {
+                console.error('Error fitting terminal:', err);
+            }
+        }
+        
+        // Resize terminal when window size changes
+        window.addEventListener('resize', fitTerminal);
+        
+        // Initial fit
+        setTimeout(fitTerminal, 100);
+        
+        let reconnectAttempts = 0;
+        function connectWebSocket() {
+            // Determine WebSocket URL based on current page URL
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            
+            const ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                statusIndicator.classList.remove('disconnected');
+                statusIndicator.classList.add('connected');
+                statusText.textContent = 'Connected';
+                terminal.writeln('\x1b[32mConnected to session.\x1b[0m');
+                fitTerminal();
+            };
+            
+            ws.onmessage = function(event) {
+                terminal.write(event.data);
+            };
+            
+            ws.onclose = function() {
+                statusIndicator.classList.remove('connected');
+                statusIndicator.classList.add('disconnected');
+                statusText.textContent = 'Disconnected';
+                terminal.writeln('\x1b[31mDisconnected from session. Attempting to reconnect...\x1b[0m');
+                
+                reconnectAttempts++;
+                if (reconnectAttempts < 5) {
+                    // Try to reconnect after a delay
+                    setTimeout(connectWebSocket, 3000);
+                } else {
+                    terminal.writeln('\x1b[31mMaximum reconnect attempts exceeded. Stopping.\x1b[0m');
+                    ws.close();
+                }
+            };
+            
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                terminal.writeln('\x1b[31mConnection error. Retrying...\x1b[0m');
+            };
+        }
+        
+        // Start connection when page loads
+        window.addEventListener('load', connectWebSocket);
+    </script>
+</body>
+</html>

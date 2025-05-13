@@ -17,7 +17,11 @@
 !README.md
 !LICENSE
 
+!pkg/liveshare/templates/*.html
+
 # !Makefile
 
 # ...even if they are in subdirectories
 !*/
+
+vendor/

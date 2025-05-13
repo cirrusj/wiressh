@@ -1,539 +1,248 @@
 package main
 
 import (
-	"encoding/base64"
-	"encoding/hex"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
-	"net"
-	"net/netip"
 	"os"
-	"os/user"
 	"path/filepath"
-	"strings"
 	"time"
 
-	"github.com/cirrusj/wiressh/recorder"
-	"github.com/kevinburke/ssh_config"
-	"golang.org/x/crypto/ssh"
-	"golang.org/x/crypto/ssh/knownhosts"
+	"github.com/cirrusj/wiressh/pkg/config"
+	"github.com/cirrusj/wiressh/pkg/liveshare"
+	"github.com/cirrusj/wiressh/pkg/recorder"
+	"github.com/cirrusj/wiressh/pkg/ssh"
 	"golang.org/x/term"
-
-	"golang.zx2c4.com/wireguard/conn"
-	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
-var (
-	debug      bool
-	recordFile string
-)
+type colorFunc func(string) string
+
+// getColorFuncs returns two functions that can be used to color strings
+// red or yellow, depending on whether the stderr is a tty or not.
+func getColorFuncs() (colorFunc, colorFunc) {
+	isatty := term.IsTerminal(int(os.Stderr.Fd()))
+
+	red := func(s string) string {
+		if isatty {
+			return "\033[31m" + s + "\033[0m"
+		}
+		return s
+	}
+
+	yellow := func(s string) string {
+		if isatty {
+			return "\033[33m" + s + "\033[0m"
+		}
+		return s
+	}
+
+	return red, yellow
+}
+
+// printUsage prints the usage message for wiressh.
+//
+// It takes a single argument, the name of the program (usually the result of
+// filepath.Base(os.Args[0])), and prints a usage message to os.Stderr.
+//
+// The message includes the program name, a description of wiressh, usage
+// information, available flags, examples, and a link to the wiressh GitHub
+// page for more information.
+func printUsage(progname string) {
+	fmt.Fprintf(os.Stderr, `
+wiressh - Simple SSH client with WireGuard and Tailscale tunnel support
+
+Usage:
+  %s [flags] host
+
+Flags:
+  -c string   Path to WireGuard configuration file (default "~/.ssh/wiressh_config")
+  -d          Enable debug logging
+  -l          Enable debug logging for the tunnel
+  -t int      Connection timeout in seconds (default 15)
+  -f          Print the configuration file format help
+  -r string   Path to record file (asciicast v2 format)
+  -s string   Enable live sharing on specified address (for example "127.0.0.1:9999")
+
+Examples:
+  wiressh myserver
+  wiressh -r session.cast myserver
+  wiressh -d -c ~/.ssh/custom_config myserver
+  wiressh -s 127.0.0.1:9999 myserver
+
+For more information, see: https://github.com/cirrusj/wiressh
+`, progname)
+}
 
 func main() {
-	// Parse arguments
 	progname := filepath.Base(os.Args[0])
-	var wireConfigFile string
-	var sshConfigFile string
-	var sshKnownHosts string
-	flag.StringVar(&wireConfigFile, "c", "~/.ssh/wiressh_config", "wiressh config")
-	flag.StringVar(&sshConfigFile, "s", "~/.ssh/config", "SSH config")
-	flag.StringVar(&sshKnownHosts, "k", "~/.ssh/known_hosts", "SSH known hosts")
-	flag.StringVar(&recordFile, "r", "", "Record session to file (asciicast v2 format)")
-	flag.BoolVar(&debug, "d", false, "Debug")
-	flag.Usage = func() {
-		_, _ = fmt.Fprintf(os.Stderr, `Usage of %s:
-	%s [flags] host
-Flags:
-`, progname, progname)
-		flag.PrintDefaults()
-	}
+	red, yellow := getColorFuncs()
+
+	// Parse command line arguments
+	wireSshConfigFile := flag.String("c", "~/.ssh/wiressh_config", "Path to WireGuard configuration file")
+	recordFile := flag.String("r", "", "Path to record file (asciicast v2 format)")
+	debug := flag.Bool("d", false, "Enable debug logging")
+	debugTunnel := flag.Bool("l", false, "Enable debug logging for the tunnel")
+	timeout := flag.Int("t", 15, "Connection timeout in seconds")
+	printConfigHelp := flag.Bool("f", false, "Print the configuration file format help")
+	liveShareAddr := flag.String("s", "", "Enable live sharing on specified address")
+	flag.Usage = func() { printUsage(progname) }
 	flag.Parse()
+
+	if *debug {
+		fmt.Fprintln(os.Stderr, red("WARNING: Debug mode enabled. This may expose sensitive information in logs."))
+		fmt.Fprintln(os.Stderr, yellow("Do not share these logs with others as they may contain private keys and credentials."))
+	}
+
+	if *printConfigHelp {
+		printConfigFormatHelp()
+		os.Exit(0)
+	}
+
 	if flag.NArg() != 1 {
-		// log.Fatalln("Missing host argument")
-		fmt.Println("Missing host argument")
+		fmt.Fprintln(os.Stderr, red("Error: Missing host argument."))
 		flag.Usage()
 		os.Exit(1)
 	}
 	host := flag.Arg(0)
-	if debug {
-		log.Println("Host:", host)
+
+	if err := validateRecordingFile(*recordFile, *debug); err != nil {
+		fmt.Fprintln(os.Stderr, red(err.Error()))
+		os.Exit(1)
 	}
 
-	// Check if recording file exists
-	if recordFile != "" {
-		if _, err := os.Stat(recordFile); err == nil {
-			log.Fatalf("Recording file %s already exists", recordFile)
-		}
+	cfg, err := config.LoadConfig(host, *wireSshConfigFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, red(fmt.Sprintf("Error loading configuration: %v", err)))
+		os.Exit(1)
 	}
 
-	if debug {
-		log.Println("Config:", wireConfigFile)
-	}
-	if strings.HasPrefix(wireConfigFile, "~/") {
-		home, _ := os.UserHomeDir()
-		wireConfigFile = filepath.Join(home, wireConfigFile[2:])
-	}
-	// Read wiressh config
-	wireConfigRead, err := os.Open(wireConfigFile)
-	if err != nil {
-		log.Fatalf("Failed to load wireguard config: %s", err)
-	}
-	wireConfig, err := ssh_config.Decode(wireConfigRead)
-	if err != nil {
-		log.Fatalf("Failed to parse wireguard config: %s", err)
-	}
-	privateKey, err := wireConfig.Get(host, "PrivateKey")
-	if err != nil {
-		log.Fatalf("Failed to get PrivateKey for %s: %s", host, err)
-	}
-	if privateKey == "" {
-		log.Fatalf("PrivateKey for host %s not found in %s", host, wireConfigFile)
-	}
-	privateKey, _ = EncodeBase64ToHex(privateKey)
-	if debug {
-		log.Println("PrivateKey:", privateKey)
-	}
-	publicKey, err := wireConfig.Get(host, "PublicKey")
-	if err != nil {
-		log.Fatalf("Failed to get PublicKey for %s: %s", host, err)
-	}
-	if publicKey == "" {
-		log.Fatalf("PublicKey for host %s not found in %s", host, wireConfigFile)
-	}
-	publicKey, _ = EncodeBase64ToHex(publicKey)
-	if debug {
-		log.Println("PublicKey:", publicKey)
-	}
-	presharedKey, _ := wireConfig.Get(host, "PresharedKey")
-	if presharedKey != "" {
-		presharedKey, _ = EncodeBase64ToHex(presharedKey)
-		if debug {
-			log.Println("PresharedKey:", presharedKey)
-		}
-	}
-	ipAddressString, err := wireConfig.Get(host, "IPAddress")
-	if err != nil {
-		log.Fatalf("Failed to get IPAddress for %s: %s", host, err)
-	}
-	if ipAddressString == "" {
-		log.Fatalf("IPAddress for host %s not found in %s", host, wireConfigFile)
-	}
-	ipAddress, err := netip.ParseAddr(ipAddressString)
-	if err != nil {
-		log.Fatalf("Failed to parse IPAddress for %s: %v", host, err)
-	}
-	if debug {
-		log.Println("IPAddress:", ipAddress)
-	}
-	dnsServerString, err := wireConfig.Get(host, "DNSServer")
-	if err != nil {
-		log.Fatalf("Failed to get DNSServer for %s: %s", host, err)
-	}
-	if dnsServerString == "" {
-		log.Fatalf("DNSServer for host %s not found in %s", host, wireConfigFile)
-	}
-	dnsServer, err := netip.ParseAddr(dnsServerString)
-	if err != nil {
-		log.Fatalf("Failed to parse DNSServer for %s: %v", host, err)
-	}
-	if debug {
-		log.Println("DNSServer:", dnsServer)
-	}
-	allowedIP, err := wireConfig.Get(host, "AllowedIP")
-	if err != nil {
-		log.Fatalf("Failed to get AllowedIP for %s: %s", host, err)
-	}
-	if allowedIP == "" {
-		allowedIP = "0.0.0.0/0"
-	}
-	if debug {
-		log.Println("AllowedIP:", allowedIP)
-	}
-	wgServerPort, err := wireConfig.Get(host, "WGServer")
-	if err != nil {
-		log.Fatalf("Failed to get WGServer for %s: %s", host, err)
-	}
-	if wgServerPort == "" {
-		log.Fatalf("WGServer for host %s not found in %s", host, wireConfigFile)
-	}
-	if debug {
-		log.Println("WGServer:", wgServerPort)
-	}
-	wgServerString, wgPort, err := net.SplitHostPort(wgServerPort)
-	if err != nil {
-		log.Fatalf("Failed to parse WGServer: %s", err)
-	}
-	wgServerIPs, err := net.LookupIP(wgServerString)
-	if err != nil {
-		log.Fatalf("Could not resolve host: %v\n", err)
-	}
-	var wgServer net.IP
-	if len(wgServerIPs) == 1 {
-		wgServer = wgServerIPs[0]
-	} else {
-		log.Fatalf("Host resolves to multiple IPs: %s\n", wgServerIPs)
-	}
-	if debug {
-		log.Println("wgServer:", wgServer)
-		log.Println("wgPort:", wgPort)
-	}
-	var wgConf string
-	if privateKey != "" {
-		wgConf = wgConf + fmt.Sprintf("private_key=%s\n", privateKey)
-	}
-	if publicKey != "" {
-		wgConf = wgConf + fmt.Sprintf("public_key=%s\n", publicKey)
-	}
-	if presharedKey != "" {
-		wgConf = wgConf + fmt.Sprintf("preshared_key=%s\n", presharedKey)
-	}
-	if wgServer != nil && wgPort != "" {
-		wgConf = wgConf + fmt.Sprintf("endpoint=%s:%s\n", wgServer, wgPort)
-	}
-	wgConf = wgConf + fmt.Sprintf("allowed_ip=%s\n", allowedIP)
-	if debug {
-		log.Println(wgConf)
+	// Override the default timeout if specified via command line
+	if *timeout != 15 { // Only override if different from default
+		cfg.SshConfig.Timeout = time.Duration(*timeout) * time.Second
 	}
 
-	// Read SSH config
-	if strings.HasPrefix(sshConfigFile, "~/") {
-		home, _ := os.UserHomeDir()
-		sshConfigFile = filepath.Join(home, sshConfigFile[2:])
-	}
-	sshConfigRead, err := os.Open(sshConfigFile)
-	if err != nil {
-		log.Fatalf("Failed to load SSH config: %s", err)
-	}
-	if debug {
-		log.Println("SSH config:", sshConfigFile)
-	}
-	sshConfig, err := ssh_config.Decode(sshConfigRead)
-	if err != nil {
-		log.Fatalf("Failed to parse SSH config: %s", err)
-	}
-	sshUser, err := sshConfig.Get(host, "User")
-	if err != nil {
-		log.Fatalf("Failed to get ssh User from config: %s", err)
-	}
-	if sshUser == "" {
-		if currentUser, err := user.Current(); err != nil {
-			log.Fatalf("Failed to get username: %s", err)
-		} else {
-			sshUser = currentUser.Username
-		}
-	}
-	if debug {
-		log.Println("SSH User:", sshUser)
-	}
-	sshHostName, err := sshConfig.Get(host, "HostName")
-	if err != nil {
-		log.Fatalf("Failed to get ssh HostName from config: %s", err)
-	}
-	if sshHostName == "" {
-		sshHostName = host
-	}
-	if debug {
-		log.Println("SSH Host:", sshHostName)
-	}
-	sshPort, err := sshConfig.Get(host, "Port")
-	if err != nil {
-		log.Fatalf("Failed to get ssh Port from config: %s", err)
-	}
-	if sshPort == "" {
-		sshPort = "22"
-	}
-	if debug {
-		log.Println("SSH Port:", sshPort)
-	}
-	sshIdentityFile, err := sshConfig.Get(host, "IdentityFile")
-	if err != nil {
-		log.Fatalf("Failed to get ssh IdentityFile from config: %s", err)
-	}
-	if strings.HasPrefix(sshIdentityFile, "~/") {
-		home, _ := os.UserHomeDir()
-		sshIdentityFile = filepath.Join(home, sshIdentityFile[2:])
-	}
-	if debug {
-		log.Println("SSH IdentityFile:", sshIdentityFile)
+	if *debug {
+		logConfig(cfg)
 	}
 
-	// Start the wg tunnel
-	tun, tnet, err := netstack.CreateNetTUN(
-		[]netip.Addr{ipAddress},
-		[]netip.Addr{dnsServer},
-		1420)
-	if err != nil {
-		log.Panic(err)
-	}
-	logLevel := device.LogLevelError
-	if debug {
-		logLevel = device.LogLevelVerbose
-	}
-	dev := device.NewDevice(tun, conn.NewDefaultBind(), device.NewLogger(logLevel, ""))
-	err = dev.IpcSet(wgConf)
-	if err != nil {
-		//		TODO: print an error
-		return
-	}
-	err = dev.Up()
-	if err != nil {
-		log.Panic(err)
-	}
+	// Initialize the SSH client
+	client := ssh.NewClient(cfg, *debug, *debugTunnel)
 
-	// Parse the SSH key
-	sshKey, err := os.ReadFile(sshIdentityFile)
-	if err != nil {
-		log.Fatalf("Failed to read IdentityFile: %s", err)
-	}
-	if debug {
-		log.Println("SSH IdentityFile:", sshIdentityFile)
-	}
-	sshSigner, err := ssh.ParsePrivateKey(sshKey)
-	if err != nil {
-		var passphraseMissingError *ssh.PassphraseMissingError
-		if errors.As(err, &passphraseMissingError) {
-			fmt.Print("Passphrase: ")
-			input, err := term.ReadPassword(int(os.Stdin.Fd()))
-			if err != nil {
-				log.Fatalf("Failed to read passphase: %s", err)
-			}
-			passphrase := strings.TrimSpace(strings.Trim(string(input), "\n"))
-			sshSigner, err = ssh.ParsePrivateKeyWithPassphrase(sshKey, []byte(passphrase))
-			if err != nil {
-				log.Fatalf("Failed to decrypt private key: %s", err)
+	// Set up live sharing and recording writers
+	var writers []io.Writer
+	if *recordFile != "" {
+		w, h := 80, 40
+		if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
+			if tw, th, err := term.GetSize(fd); err == nil {
+				w, h = tw, th
 			}
 		}
-	}
-
-	if strings.HasPrefix(sshKnownHosts, "~/") {
-		home, _ := os.UserHomeDir()
-		sshKnownHosts = filepath.Join(home, sshKnownHosts[2:])
-	}
-	hostKeyCallback, err := knownhosts.New(sshKnownHosts)
-	if err != nil {
-		log.Fatalf("Could not read known hosts: %s ", err)
-	}
-	// Configure the SSH client
-	sshClientConfig := &ssh.ClientConfig{
-		User: sshUser,
-		Auth: []ssh.AuthMethod{
-			ssh.PublicKeys(sshSigner),
-		},
-		HostKeyCallback: hostKeyCallback,
-		Timeout:         5 * time.Second,
-	}
-
-	// Connect
-	sshConnect(tnet, sshHostName, sshPort, sshClientConfig)
-}
-
-func EncodeBase64ToHex(key string) (string, error) {
-	decoded, err := base64.StdEncoding.DecodeString(key)
-	if err != nil {
-		return "", errors.New("invalid base64 string: " + key)
-	}
-	if len(decoded) != 32 {
-		return "", errors.New("key should be 32 bytes: " + key)
-	}
-	return hex.EncodeToString(decoded), nil
-}
-
-func DialWG(network, addr string, config *ssh.ClientConfig, tnet *netstack.Net) (*ssh.Client, error) {
-	// Use wg tnet to dial the connection
-	connection, err := tnet.Dial(network, addr)
-	if err != nil {
-		return nil, err
-	}
-	c, chans, reqs, err := ssh.NewClientConn(connection, addr, config)
-	if err != nil {
-		return nil, err
-	}
-	return ssh.NewClient(c, chans, reqs), nil
-}
-
-func sshConnect(tnet *netstack.Net, host string, port string, clientConfig *ssh.ClientConfig) {
-	// SSH connect
-	address := net.JoinHostPort(host, port)
-	sshClient, err := DialWG("tcp", address, clientConfig, tnet)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func(sshClient *ssh.Client) {
-		err := sshClient.Close()
+		rec, err := recorder.NewRecorder(*recordFile, w, h, "xterm", fmt.Sprintf("wiressh session to %s", cfg.SshConfig.HostName))
 		if err != nil {
-			log.Println("Error when closing ssh:", err)
+			fmt.Fprintln(os.Stderr, red(fmt.Sprintf("Error initializing session recorder: %v", err)))
+			os.Exit(1)
 		}
-	}(sshClient)
-	if debug {
-		log.Printf("Connected to %s\n", host)
-	}
-	session, err := sshClient.NewSession()
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer func(session *ssh.Session) {
-		err := session.Close()
-		if err != nil {
-			log.Println("Error when closing session:", err)
-		}
-	}(session)
-
-	// Configure the pty
-	var askTerm string
-	switch t := os.Getenv("TERM"); t {
-	case "", "xterm-256color":
-		askTerm = "xterm-256color"
-	case "xterm":
-		askTerm = "xterm"
-	default:
-		askTerm = "xterm-256color"
-	}
-	if debug {
-		log.Println("TERM:", askTerm)
-	}
-
-	var rec *recorder.Recorder
-	if recordFile != "" {
-		w, h, err := term.GetSize(int(os.Stdin.Fd()))
-		if err != nil {
-			log.Println("Could not get term size. Setting to 80, 40")
-			w, h = 80, 40
-		}
-		rec, err = recorder.NewRecorder(recordFile, w, h, askTerm, fmt.Sprintf("wiressh session to %s", host))
-		if err != nil {
-			log.Fatalf("Failed to create recorder: %v", err)
-		}
+		writers = append(writers, rec)
 		defer rec.Close()
 	}
-
-	if fd := int(os.Stdin.Fd()); term.IsTerminal(fd) {
-		if originalState, err := term.MakeRaw(fd); err != nil {
-			log.Println("Fallback")
-		} else {
-			defer func(fd int, oldState *term.State) {
-				err := term.Restore(fd, oldState)
-				if err != nil {
-					log.Println("Error when restoring term:", err)
-				}
-			}(fd, originalState)
-			w, h, err := term.GetSize(fd)
-			if err != nil {
-				log.Println("Could not get term size. Setting to 80, 40")
-				w, h = 80, 40
-			}
-			if err := session.RequestPty(askTerm, h, w, ssh.TerminalModes{
-				ssh.ECHO: 0,
-			}); err != nil {
-				log.Fatalf("Request for pseudo terminal failed: %s", err)
-			}
-			// Resize pty as required
-			go func() {
-				for {
-					_, ok := <-time.After(100 * time.Millisecond)
-					if !ok {
-						break
-					}
-					newW, newH, _ := term.GetSize(fd)
-					if newW != w || newH != h {
-						err := session.WindowChange(h, w)
-						if err != nil {
-							log.Println("Error when informing remote host of a window size change:", err)
-						}
-						h = newH
-						w = newW
-					}
-				}
-			}()
+	var liveShareWriter io.Writer
+	if *liveShareAddr != "" {
+		fmt.Printf("Live sharing enabled on http://%s\n", *liveShareAddr)
+		var err error
+		liveShareWriter, err = liveshare.Start(*liveShareAddr, *debug)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, red(fmt.Sprintf("Error starting live sharing server: %v", err)))
+			os.Exit(1)
 		}
+		writers = append(writers, liveShareWriter)
+		defer liveshare.Stop()
 	}
 
-	// Get data
-	stdin, err := session.StdinPipe()
-	if err != nil {
-		log.Fatal(err)
-	}
-	go func() {
-		if rec != nil {
-			// Wrap stdin with recorder
-			tee := io.TeeReader(os.Stdin, &recordingWriter{rec: rec, isInput: true})
-			_, err := io.Copy(stdin, tee)
-			if err != nil {
-				log.Println("Error when doing an io.Copy:", err)
-			}
-		} else {
-			_, err := io.Copy(stdin, os.Stdin)
-			if err != nil {
-				log.Println("Error when doing an io.Copy:", err)
-			}
-		}
-	}()
-	stdout, err := session.StdoutPipe()
-	if err != nil {
-		log.Fatal(err)
-	}
-	go func() {
-		if rec != nil {
-			// Wrap stdout with recorder
-			tee := io.TeeReader(stdout, &recordingWriter{rec: rec, isInput: false})
-			_, err := io.Copy(os.Stdout, tee)
-			if err != nil {
-				log.Println("Error when doing an io.Copy:", err)
-			}
-		} else {
-			_, err := io.Copy(os.Stdout, stdout)
-			if err != nil {
-				log.Println("Error when doing an io.Copy:", err)
-			}
-		}
-	}()
-	stderr, err := session.StderrPipe()
-	if err != nil {
-		log.Fatal(err)
-	}
-	go func() {
-		if rec != nil {
-			// Wrap stderr with recorder
-			tee := io.TeeReader(stderr, &recordingWriter{rec: rec, isInput: false})
-			_, err := io.Copy(os.Stderr, tee)
-			if err != nil {
-				log.Println("Error when doing an io.Copy:", err)
-			}
-		} else {
-			_, err := io.Copy(os.Stderr, stderr)
-			if err != nil {
-				log.Println("Error when doing an io.Copy:", err)
-			}
-		}
-	}()
-
-	// Start the shell
-	if err := session.Shell(); err != nil {
-		log.Fatal(err)
-	}
-
-	// Wait to complete
-	if err := session.Wait(); err != nil {
-		log.Fatal(err)
-	}
-}
-
-// recordingWriter implements io.Writer and writes to the recorder
-type recordingWriter struct {
-	rec     *recorder.Recorder
-	isInput bool
-}
-
-func (w *recordingWriter) Write(p []byte) (n int, err error) {
-	if w.isInput {
-		err = w.rec.WriteInput(p)
+	var outputWriter io.Writer
+	if len(writers) == 1 {
+		outputWriter = writers[0]
+	} else if len(writers) > 1 {
+		outputWriter = io.MultiWriter(writers...)
 	} else {
-		err = w.rec.WriteOutput(p)
+		outputWriter = nil
 	}
-	if err != nil {
-		return 0, err
+	// Connect to the SSH server with optional recording/live sharing
+	if err := client.Connect(outputWriter); err != nil {
+		fmt.Fprintln(os.Stderr, red(fmt.Sprintf("Error: %v", err)))
+		os.Exit(1)
 	}
-	return len(p), nil
+
+	if *debug {
+		logSessionEnd(host, *recordFile, yellow)
+	}
+}
+
+// printConfigFormatHelp prints the wiressh config file format to stdout.
+func printConfigFormatHelp() {
+	fmt.Println("wiressh config file format (similar to ssh_config):")
+	fmt.Println("Host <pattern>")
+	fmt.Println("  Type           wireguard | tailscale | direct (required)")
+	fmt.Println("  Hostname       Hostname of the server (optional, overrides host argument)")
+	fmt.Println("  User           Username to connect as (optional, defaults to current user)")
+	fmt.Println("  Port           Port to connect to (optional, defaults to 22)")
+	fmt.Println("  IdentityFile   Path to the private key file (optional, defaults to ~/.ssh/id_rsa)")
+	fmt.Println("  HostKey        Remote server host key (optional, if not provided the remote server host key will be printed and the user will be asked if they want to continue)")
+	fmt.Println("  LocalForward   Configure an SSH LocalForward (optional, see ssh_config for more details)")
+	fmt.Println("\n# WireGuard-specific:")
+	fmt.Println("  PrivateKey     WireGuard private key (required)")
+	fmt.Println("  PublicKey      WireGuard public key (required)")
+	fmt.Println("  PresharedKey   WireGuard preshared key (optional)")
+	fmt.Println("  AllowedIP      WireGuard allowed IP (optional, defaults to 0.0.0.0/0)")
+	fmt.Println("  WGServer       WireGuard server formatted as host:port (required)")
+	fmt.Println("  IPAddress      IP address to bind the WireGuard tunnel to (required)")
+	fmt.Println("  DNSServer      DNS server to use for the WireGuard tunnel (required)")
+	fmt.Println("\n# Tailscale-specific:")
+	fmt.Println("  AuthKey        Tailscale auth key (required)")
+}
+
+// validateRecordingFile validates the recording file, if specified, and returns an error if the file already exists.
+// If debug is true, it will log the recording file name.
+func validateRecordingFile(recordFile string, debug bool) error {
+	if recordFile == "" {
+		return nil
+	}
+
+	if _, err := os.Stat(recordFile); err == nil {
+		return fmt.Errorf("the recording file '%s' already exists. Please choose a different file name or remove the existing file", recordFile)
+	}
+
+	if debug {
+		log.Println("Recording to:", recordFile)
+	}
+
+	return nil
+}
+
+// logConfig logs the configuration, with private keys redacted for security.
+func logConfig(cfg *config.WireSshConfig) {
+	cfgForLog := *cfg
+	if cfgForLog.WireguardConfig.PrivateKey != "" {
+		cfgForLog.WireguardConfig.PrivateKey = "[REDACTED]"
+	}
+	if cfgForLog.WireguardConfig.PublicKey != "" {
+		cfgForLog.WireguardConfig.PublicKey = "[REDACTED]"
+	}
+	if cfgForLog.WireguardConfig.PresharedKey != "" {
+		cfgForLog.WireguardConfig.PresharedKey = "[REDACTED]"
+	}
+	if cfgForLog.TailscaleConfig.AuthKey != "" {
+		cfgForLog.TailscaleConfig.AuthKey = "[REDACTED]"
+	}
+	log.Printf("Configuration (keys redacted): %+v\n", cfgForLog)
+}
+
+// logSessionEnd logs a message indicating the end of a session, including the host and recording file (if specified).
+// The message is printed to stderr and colored yellow.
+func logSessionEnd(host, recordFile string, yellow colorFunc) {
+	msg := "Session ended. SSH connection to " + host + " closed."
+	if recordFile != "" {
+		msg += " Session recorded to " + recordFile + "."
+	}
+	fmt.Fprintln(os.Stderr, yellow(msg))
 }

@@ -25,7 +25,7 @@ type AsciicastEvent struct {
 	Data string  `json:"data"`
 }
 
-// Recorder handles recording terminal sessions in asciicast v2 format
+// Recorder handles recording terminal sessions in asciicast v2 format.
 type Recorder struct {
 	file   *os.File
 	start  time.Time
@@ -35,7 +35,15 @@ type Recorder struct {
 	title  string
 }
 
-// NewRecorder creates a new recorder that writes to the specified file
+// RecorderIface is an interface for recording terminal input and output.
+type RecorderIface interface {
+	WriteInput([]byte) error
+	WriteOutput([]byte) error
+}
+
+var _ RecorderIface = (*Recorder)(nil)
+
+// NewRecorder creates a new recorder that writes to the specified file.
 func NewRecorder(filename string, width, height int, term, title string) (*Recorder, error) {
 	file, err := os.Create(filename)
 	if err != nil {
@@ -79,7 +87,7 @@ func NewRecorder(filename string, width, height int, term, title string) (*Recor
 	}, nil
 }
 
-// WriteOutput records terminal output
+// WriteOutput records terminal output.
 func (r *Recorder) WriteOutput(data []byte) error {
 	event := []interface{}{
 		time.Since(r.start).Seconds(),
@@ -101,7 +109,7 @@ func (r *Recorder) WriteOutput(data []byte) error {
 	return err
 }
 
-// WriteInput records terminal input
+// WriteInput records terminal input.
 func (r *Recorder) WriteInput(data []byte) error {
 	event := []interface{}{
 		time.Since(r.start).Seconds(),
@@ -123,7 +131,16 @@ func (r *Recorder) WriteInput(data []byte) error {
 	return err
 }
 
-// Close closes the recorder and its underlying file
+// Write implements io.Writer for Recorder, writing output events.
+func (r *Recorder) Write(p []byte) (int, error) {
+	err := r.WriteOutput(p)
+	if err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// Close closes the recorder and its underlying file.
 func (r *Recorder) Close() error {
 	return r.file.Close()
 }
