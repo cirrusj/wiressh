@@ -8,12 +8,15 @@ import (
 
 func TestStartAndStop(t *testing.T) {
 	// Use port 0 to let the OS pick an available port
-	writer, err := Start("127.0.0.1:0", true)
+	writer, password, err := Start("127.0.0.1:0", true)
 	if err != nil {
 		t.Fatalf("Start() returned error: %v", err)
 	}
 	if writer == nil {
 		t.Fatalf("Start() returned nil writer")
+	}
+	if password == "" {
+		t.Fatalf("Start() returned empty password")
 	}
 
 	// Give the server a moment to start
@@ -34,11 +37,11 @@ func TestStartAndStop(t *testing.T) {
 }
 
 func TestStartTwice(t *testing.T) {
-	_, err := Start("127.0.0.1:0", false)
+	_, _, err := Start("127.0.0.1:0", false)
 	if err != nil {
 		t.Fatalf("First Start() returned error: %v", err)
 	}
-	_, err = Start("127.0.0.1:0", false)
+	_, _, err = Start("127.0.0.1:0", false)
 	if err != nil {
 		t.Errorf("Second Start() returned error: %v", err)
 	}

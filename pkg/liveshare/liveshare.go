@@ -11,8 +11,14 @@ var (
 )
 
 // Start initializes and starts the live sharing server in a goroutine
-func Start(addr string, debug bool) (io.Writer, error) {
-	server = NewServer(addr, debug)
+func Start(addr string, debug bool) (io.Writer, string, error) {
+	// Generate a secure random password
+	password, err := generateRandomPassword()
+	if err != nil {
+		return nil, "", err
+	}
+
+	server = NewServer(addr, debug, password)
 	
 	// Start the server in a goroutine
 	go func() {
@@ -23,7 +29,7 @@ func Start(addr string, debug bool) (io.Writer, error) {
 		}
 	}()
 	
-	return server, nil
+	return server, password, nil
 }
 
 // Stop shuts down the live sharing server

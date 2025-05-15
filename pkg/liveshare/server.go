@@ -25,10 +25,11 @@ type Server struct {
 	mutex      sync.Mutex
 	server     *http.Server
 	debug      bool
+	password   string
 }
 
 // NewServer creates a new live sharing server
-func NewServer(addr string, debug bool) *Server {
+func NewServer(addr string, debug bool, password string) *Server {
 	if addr == "" {
 		addr = "127.0.0.1:9999"
 	}
@@ -39,6 +40,7 @@ func NewServer(addr string, debug bool) *Server {
 		register:   make(chan *websocket.Conn),
 		unregister: make(chan *websocket.Conn),
 		debug:      debug,
+		password:   password,
 	}
 }
 
@@ -68,6 +70,13 @@ func (s *Server) Start() error {
 
 	// Handle WebSocket connections
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		// Check authentication
+		providedPassword := r.URL.Query().Get("password")
+		if providedPassword != s.password {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			if s.debug {
@@ -114,6 +123,19 @@ func (s *Server) Start() error {
 
 // Stop gracefully shuts down the server
 func (s *Server) Stop() error {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	
+	// Close all client connections with a normal closure code (1000)
+	for client := range s.clients {
+		client.WriteControl(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, "Session ended"),
+			time.Now().Add(5*time.Second),
+		)
+		client.Close()
+	}
+	
 	if s.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
