@@ -146,18 +146,15 @@ func main() {
 		writers = append(writers, rec)
 		defer rec.Close()
 	}
-	var liveShareWriter io.Writer
 	if *liveShareAddr != "" {
-		var liveSharePassword string
 		var err error
-		liveShareWriter, liveSharePassword, err = liveshare.Start(*liveShareAddr, *debug)
+		var liveShareServer *liveshare.Server
+		liveShareServer, err = liveshare.Start(*liveShareAddr, *debug)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, red(fmt.Sprintf("Error starting live sharing server: %v", err)))
 			os.Exit(1)
 		}
-		fmt.Printf("Live sharing enabled on http://%s\n", *liveShareAddr)
-		fmt.Printf("Live sharing password: %s\n", liveSharePassword)
-		writers = append(writers, liveShareWriter)
+		writers = append(writers, liveShareServer)
 		defer liveshare.Stop()
 	}
 

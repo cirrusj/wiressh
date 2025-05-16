@@ -2,9 +2,19 @@ package liveshare
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"embed"
+	"fmt"
 	"html/template"
+	"io"
 	"log"
+	"math/big"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -17,15 +27,16 @@ var templateFS embed.FS
 
 // Server represents a live sharing server for SSH sessions
 type Server struct {
-	addr       string
-	clients    map[*websocket.Conn]bool
-	broadcast  chan []byte
-	register   chan *websocket.Conn
-	unregister chan *websocket.Conn
-	mutex      sync.Mutex
-	server     *http.Server
-	debug      bool
-	password   string
+	addr            string
+	clients         map[*websocket.Conn]bool
+	broadcast       chan []byte
+	register        chan *websocket.Conn
+	unregister      chan *websocket.Conn
+	mutex           sync.Mutex
+	server          *http.Server
+	debug           bool
+	password        string
+	certFingerprint string
 }
 
 // NewServer creates a new live sharing server
@@ -44,8 +55,85 @@ func NewServer(addr string, debug bool, password string) *Server {
 	}
 }
 
-// Start initializes and starts the web server
+// calculateFingerprint calculates the SHA-256 fingerprint of a certificate
+// Returns the fingerprint in lowercase without colons (e.g., "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
+func calculateFingerprint(certBytes []byte) string {
+	hash := sha256.Sum256(certBytes)
+	return fmt.Sprintf("%x", hash)
+}
+
+// generateSelfSignedCert generates a self-signed certificate for localhost
+func generateSelfSignedCert() (tls.Certificate, error) {
+	// Generate private key
+	priv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// Create certificate template
+	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	template := x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			Organization: []string{"WireSSH Live Share"},
+			CommonName:   "localhost",
+		},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().AddDate(10, 0, 0), // Valid for 10 years
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		IPAddresses:           []net.IP{net.IPv4(127, 0, 0, 1)},
+		DNSNames:              []string{"localhost"},
+	}
+
+	// Create self-signed certificate
+	derBytes, err := x509.CreateCertificate(rand.Reader, &template, &template, &priv.PublicKey, priv)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+
+	// Create tls.Certificate
+	return tls.Certificate{
+		Certificate: [][]byte{derBytes},
+		PrivateKey:  priv,
+	}, nil
+}
+
+// Start initializes and starts the web server with HTTPS
 func (s *Server) Start() error {
+	// Generate self-signed certificate
+	cert, err := generateSelfSignedCert()
+	if err != nil {
+		return err
+	}
+
+	// Calculate and store certificate fingerprint
+	s.certFingerprint = calculateFingerprint(cert.Certificate[0])
+
+	// Print connection information
+	fmt.Printf("Live sharing enabled on https://%s\n", s.addr)
+	fmt.Printf("Certificate fingerprint: %s\n", s.certFingerprint)
+	fmt.Printf("Live sharing password: %s\n", s.password)
+
+	// Configure TLS
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"http/1.1", "h2"},
+		// Suppress TLS handshake errors when debug is not enabled
+		GetConfigForClient: func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			return &tls.Config{
+				Certificates: []tls.Certificate{cert},
+				NextProtos:   []string{"http/1.1", "h2"},
+			}, nil
+		},
+	}
+
 	// Configure websocket upgrader
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
@@ -108,24 +196,50 @@ func (s *Server) Start() error {
 		}
 	})
 
-	// Create HTTP server
+	// Create HTTPS server with TLS config
 	s.server = &http.Server{
-		Addr:    s.addr,
-		Handler: mux,
+		Addr:      s.addr,
+		Handler:   mux,
+		TLSConfig: tlsConfig,
+	}
+
+	// Configure error logging based on debug flag
+	if !s.debug {
+		s.server.ErrorLog = log.New(io.Discard, "", 0)
 	}
 
 	// Start client handler goroutine
 	go s.handleClients()
 
-	// Start server
-	return s.server.ListenAndServe()
+	// Start HTTPS server
+	httpsListener, err := net.Listen("tcp", s.addr)
+	if err != nil {
+		return err
+	}
+
+	// Create a TLS listener for HTTPS
+	tlsListener := tls.NewListener(httpsListener, tlsConfig)
+
+	if s.debug {
+		log.Printf("Starting HTTPS server on https://%s", s.addr)
+	}
+
+	// Start the HTTPS server (this is the main server)
+	return s.server.Serve(tlsListener)
+}
+
+// GetCertFingerprint returns the SHA-256 fingerprint of the server's certificate
+func (s *Server) GetCertFingerprint() string {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+	return s.certFingerprint
 }
 
 // Stop gracefully shuts down the server
 func (s *Server) Stop() error {
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
-	
+
 	// Close all client connections with a normal closure code (1000)
 	for client := range s.clients {
 		client.WriteControl(
@@ -135,7 +249,7 @@ func (s *Server) Stop() error {
 		)
 		client.Close()
 	}
-	
+
 	if s.server != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()

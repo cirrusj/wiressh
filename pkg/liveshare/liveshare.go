@@ -1,8 +1,8 @@
 package liveshare
 
 import (
-	"io"
 	"log"
+	"net/http"
 )
 
 var (
@@ -11,25 +11,24 @@ var (
 )
 
 // Start initializes and starts the live sharing server in a goroutine
-func Start(addr string, debug bool) (io.Writer, string, error) {
+func Start(addr string, debug bool) (*Server, error) {
 	// Generate a secure random password
 	password, err := generateRandomPassword()
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 
 	server = NewServer(addr, debug, password)
-	
+
 	// Start the server in a goroutine
 	go func() {
-		if err := server.Start(); err != nil {
-			if debug {
-				log.Printf("Live sharing server error: %v", err)
-			}
+		err := server.Start()
+		if err != nil && err != http.ErrServerClosed {
+			log.Printf("Error starting live sharing server: %v", err)
 		}
 	}()
-	
-	return server, password, nil
+
+	return server, nil
 }
 
 // Stop shuts down the live sharing server

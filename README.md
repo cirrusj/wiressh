@@ -101,7 +101,7 @@ You can share your SSH session in real-time (read-only) via a web browser by ena
 wiressh -s 127.0.0.1:9999 myserver
 ```
 
-This starts a web server on `127.0.0.1:9999` by default. You (or others with access) can open a browser and view the SSH terminal session as it happens. This is a **read-only** feature—viewers cannot interact with the SSH session.
+This starts a web server on `127.0.0.1:9999` by default. A browser can be used to connect to the server and view the SSH terminal session as it happens. This is a **read-only** feature—viewers cannot interact with the SSH session. When starting `wiressh` with the `-s` flag, it will print the connection information to the terminal, including the address, certificate fingerprint, and password. The user connecting to the server should use the certificate fingerprint to verify the connection is secure, and will be able to use the password to view the session.
 
 The live sharing feature uses [@xterm/xterm](https://xtermjs.org/) for the terminal display. The JS files are loaded from [jsDelivr](https://www.jsdelivr.com/) (Subresource Integrity hashes are used to verify the files).
 
@@ -127,7 +127,6 @@ You need to create an ephemeral, pre-approved, reusable (or not if for a single 
   - Wireguard should work, as long as a different details are used for each host. Running with the same details, should cause the first `wiressh` instance to stop working
 - tsnet seems to use MagicDNS names, and then net.Resolver for everything else (https://github.com/tailscale/tailscale/issues/4677)
 - Not tested in various operating systems
-- The live sharing feature does not support https. Do not use to share sensitive data
 - I am not a developer and don't know Go :)
 
 **Do not use on production systems**
