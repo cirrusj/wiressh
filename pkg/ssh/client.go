@@ -369,7 +369,10 @@ func (c *Client) Connect(outputWriter io.Writer) error {
 	}
 
 	go func() {
-		_, _ = io.Copy(stdin, os.Stdin)
+		_, err := io.Copy(stdin, os.Stdin)
+		if err != nil && !errors.Is(err, io.EOF) {
+			log.Printf("Error copying data to stdin: %v", err)
+		}
 	}()
 
 	stdout, err := session.StdoutPipe()
